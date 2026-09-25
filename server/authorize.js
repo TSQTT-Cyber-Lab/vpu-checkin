@@ -3,7 +3,7 @@
 // the React UI happens to hide a button.
 //
 // An event belongs to the manager whose email is in its `createdBy`. Admins may do anything
-// to any event; the owner may replace it only before it starts, and afterwards may still
+// to any event except create one in someone else's name; the owner may replace it only before it starts, and afterwards may still
 // adjust the live settings in QUICK_FIELDS. Keep this in sync with canEditEvent in src/lib/auth.ts.
 import { attKeyOf, computeRole, hashEmail, normalizeEmail } from './roles.js';
 
@@ -24,6 +24,7 @@ export async function authorize({ method, path, session, rolesDoc, bootstrapAdmi
   const email = signedIn ? normalizeEmail(session.email) : null;
   const { isAdmin, isManager } = computeRole(rolesDoc, session?.email, bootstrapAdminEmail);
   const segs = path.split('/');
+  if (segs.includes('')) return false; // empty segments (events/, events//x) are never valid ids
 
   if (path === 'config/roles') return isWrite ? isAdmin : signedIn;
   if (path === 'config/app') return isWrite ? isManager : signedIn;
@@ -39,10 +40,10 @@ export async function authorize({ method, path, session, rolesDoc, bootstrapAdmi
       if (!existing) return normalizeEmail(b.createdBy) === email; // creating: only as yourself
       if (isAdmin) return true;
       return isOwner(existing, email) && notStarted(existing, now)
-        && normalizeEmail(b.createdBy) === normalizeEmail(existing.createdBy);
+        && normalizeEmail(b.createdBy) === email;
     }
     if (method === 'PATCH') {
-      if (!existing || isAdmin) return true; // a missing doc is answered with 404 by the route
+      if (isAdmin) return true; // a missing doc is answered with 404 by the route
       if (!isOwner(existing, email) || 'createdBy' in b) return false;
       return notStarted(existing, now) || Object.keys(b).every((k) => QUICK_FIELDS.has(k));
     }

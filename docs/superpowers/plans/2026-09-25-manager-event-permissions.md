@@ -620,7 +620,8 @@ test('DELETE event: an admin may delete any event', async () => {
 
 test('PUT event: overwriting someone else\'s event is refused, creating your own works', async () => {
   await withApi(async ({ call, store }) => {
-    const bad = await call(OWNER, 'PUT', 'doc/events/theirs', { title: 'hijack', createdBy: OWNER });
+    // Keeps the victim's createdBy on purpose, so only the ownership check can refuse it.
+    const bad = await call(OWNER, 'PUT', 'doc/events/theirs', { title: 'hijack', createdBy: OTHER });
     assert.equal(bad.status, 403);
     assert.equal(store.docs.get('events/theirs').title, 'Theirs');
 
