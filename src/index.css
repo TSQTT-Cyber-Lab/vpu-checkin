@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Brand: white ground, deep navy (#0B2A66), bright red (#E5172F).
+     Deliberately a single light theme: white is a brand colour here, so the page
+     paints its own colours on any host theme instead of inverting. */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 70% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 70% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 70% 12%;
+    --primary: 221 80% 22%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 221 60% 95%;
+    --secondary-foreground: 221 80% 22%;
+    --muted: 222 40% 96.5%;
+    --muted-foreground: 222 18% 40%;
+    --accent: 221 70% 96%;
+    --accent-foreground: 221 80% 22%;
+    --destructive: 353 82% 49%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 30% 88%;
+    --input: 222 28% 80%;
+    --ring: 221 80% 30%;
+    --ok: 221 80% 26%;
+    --ok-soft: 221 75% 95%;
+    --bad: 353 82% 45%;
+    --bad-soft: 353 100% 96.5%;
+    --warn: 353 55% 38%;
+    --warn-soft: 350 60% 97%;
+    --radius: 0.4rem;
+    color-scheme: light;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body {
+    background: hsl(var(--background));
+  }
+  body {
+    @apply text-foreground antialiased;
+    font-family: 'Be Vietnam Pro', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+  }
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  .mono {
+    font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase text-muted-foreground;
+    letter-spacing: 0.08em;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      animation: none !important;
+      transition: none !important;
+    }
+  }
+}
