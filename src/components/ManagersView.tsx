@@ -23,6 +23,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<{ tone: 'ok' | 'bad' | 'warn'; text: string } | null>(null);
   const [confirmDrop, setConfirmDrop] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null); // email of the entry being edited
 
   const entries = useMemo(() => {
     const list = roles?.entries ?? [];
@@ -34,6 +35,23 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
     await p.db.doc('config/roles').set({ entries: next } satisfies RolesDoc as unknown as Record<string, unknown>);
   }
 
+  function startEdit(e: RoleEntry) {
+    setEditing(e.email);
+    setEmail(e.email);
+    setName(e.name ?? '');
+    setRole(e.role);
+    setNote(null);
+    setConfirmDrop(null);
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setEmail('');
+    setName('');
+    setRole('manager');
+    setNote(null);
+  }
+
   async function add(ev: React.FormEvent) {
     ev.preventDefault();
     const addr = normalizeEmail(email);
@@ -41,27 +59,40 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
 
     const current = roles?.entries ?? EMPTY_ROLES.entries;
     const existing = current.find((e) => normalizeEmail(e.email) === addr);
-    if (existing?.role === role) {
+    if (editing && !existing) {
+      // Someone revoked this grant while the form was open: saving must not silently bring it back.
+      cancelEdit();
+      return setNote({ tone: 'warn', text: `${addr} không còn trong danh sách quyền (có thể vừa bị thu hồi). Hãy thêm lại nếu bạn vẫn muốn cấp quyền.` });
+    }
+    if (!editing && existing?.role === role) {
       return setNote({ tone: 'warn', text: `${addr} đã là ${ROLE_LABEL[role].toLowerCase()}.` });
     }
 
     setBusy(true);
     try {
-      const entry: RoleEntry = {
-        email: addr,
-        name: name.trim() || existing?.name || '',
-        role,
-        addedAt: new Date().toISOString(),
-        addedBy: session.email,
-      };
+      const entry: RoleEntry = editing && existing
+        ? { ...existing, name: name.trim(), role } // editing keeps who granted it and when
+        : {
+          email: addr,
+          name: name.trim() || existing?.name || '',
+          role,
+          addedAt: new Date().toISOString(),
+          addedBy: session.email,
+        };
       await write([...current.filter((e) => normalizeEmail(e.email) !== addr), entry]);
       setEmail('');
       setName('');
+      if (editing) {
+        setEditing(null);
+        setRole('manager');
+      }
       setNote({
         tone: 'ok',
-        text: existing
-          ? `Đã đổi quyền của ${addr} thành ${ROLE_LABEL[role].toLowerCase()}.`
-          : `Đã thêm ${addr} làm ${ROLE_LABEL[role].toLowerCase()}. Người này đăng nhập bằng đúng email trên là dùng được ngay.`,
+        text: editing
+          ? `Đã cập nhật ${addr}.`
+          : existing
+            ? `Đã đổi quyền của ${addr} thành ${ROLE_LABEL[role].toLowerCase()}.`
+            : `Đã thêm ${addr} làm ${ROLE_LABEL[role].toLowerCase()}. Người này đăng nhập bằng đúng email trên là dùng được ngay.`,
       });
     } catch (e: any) {
       setNote({ tone: 'bad', text: permissionMessage(e) });
@@ -74,6 +105,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
     setBusy(true);
     try {
       await write((roles?.entries ?? []).filter((e) => normalizeEmail(e.email) !== normalizeEmail(addr)));
+      if (editing && normalizeEmail(editing) === normalizeEmail(addr)) cancelEdit();
       setNote({ tone: 'ok', text: `Đã thu hồi quyền của ${addr}.` });
     } catch (e: any) {
       setNote({ tone: 'bad', text: permissionMessage(e) });
@@ -86,11 +118,11 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
   return (
     <div className="grid gap-5 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
       <section className="space-y-3">
-        <div className="eyebrow">Cấp quyền</div>
+        <div className="eyebrow">{editing ? 'Sửa người quản lý' : 'Cấp quyền'}</div>
         <form onSubmit={add} className="grid gap-3 rounded-md border bg-card p-4" noValidate>
           <div className="grid gap-1.5">
             <Label htmlFor="r-email">Email người được cấp quyền</Label>
-            <Input id="r-email" className="mono" inputMode="email" autoComplete="off" value={email}
+            <Input id="r-email" className="mono" inputMode="email" autoComplete="off" value={email} disabled={!!editing}
               onChange={(e) => { setEmail(e.target.value); setNote(null); }} placeholder="nguyen.van.a@tbd.edu.vn" />
           </div>
           <div className="grid gap-1.5">
@@ -109,11 +141,14 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
             </div>
             <p className="text-[13px] text-muted-foreground">
               {role === 'manager'
-                ? 'Tạo sự kiện, sinh mã QR, theo dõi và xuất danh sách điểm danh.'
-                : 'Toàn quyền của người quản lý, cộng thêm quyền cấp và thu hồi quyền cho người khác.'}
+                ? 'Tạo sự kiện, sinh mã QR; sửa (trước giờ bắt đầu), xoá, theo dõi và xuất danh sách điểm danh của sự kiện do mình tạo.'
+                : 'Toàn quyền của người quản lý, cộng thêm quản lý mọi sự kiện và quyền cấp, sửa, thu hồi quyền cho người khác.'}
             </p>
           </div>
-          <Button type="submit" disabled={busy || !email.trim()}>{busy ? 'Đang lưu…' : 'Thêm người quản lý'}</Button>
+          <div className="flex flex-wrap gap-2">
+            <Button type="submit" disabled={busy || !email.trim()}>{busy ? 'Đang lưu…' : editing ? 'Lưu thay đổi' : 'Thêm người quản lý'}</Button>
+            {editing && <Button type="button" variant="ghost" disabled={busy} onClick={cancelEdit}>Huỷ sửa</Button>}
+          </div>
         </form>
 
         {note && <Notice tone={note.tone}>{note.text}</Notice>}
@@ -175,10 +210,13 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
                           <Button size="sm" variant="ghost" onClick={() => setConfirmDrop(null)}>Huỷ</Button>
                         </span>
                       ) : (
-                        <Button size="sm" variant="ghost" className="text-bad hover:text-bad" disabled={busy}
-                          onClick={() => setConfirmDrop(e.email)}>
-                          {isSelf ? 'Bỏ quyền của tôi' : 'Thu hồi'}
-                        </Button>
+                        <span className="inline-flex gap-1">
+                          <Button size="sm" variant="ghost" disabled={busy} aria-label={`Sửa ${e.email}`} onClick={() => startEdit(e)}>Sửa</Button>
+                          <Button size="sm" variant="ghost" className="text-bad hover:text-bad" disabled={busy}
+                            onClick={() => setConfirmDrop(e.email)}>
+                            {isSelf ? 'Bỏ quyền của tôi' : 'Thu hồi'}
+                          </Button>
+                        </span>
                       )}
                     </td>
                   </tr>

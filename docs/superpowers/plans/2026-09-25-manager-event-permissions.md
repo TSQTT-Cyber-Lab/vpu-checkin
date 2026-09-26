@@ -19,6 +19,8 @@
 **Deliberate deviations from the spec (keep, but tell the user at handoff)**
 1. Spec §4.1 lists `canTweakEvent` / `canDeleteEvent`. Because the console only lists events the user owns (or all, for admins), those two would always be `true` there, so they are not added. The server still enforces both.
 2. Spec §4.2 keeps the client-side cascade in demo mode. The old client loop never actually removed records (`update()` deep-merges, so a deleted key survives), so it is dropped; the server cascade replaces it and the in-memory demo simply leaves invisible leftovers.
+3. Task 5 verifies the cascade SQL on a real `postgres:15-alpine` container (Docker Desktop was turned on), not on PGlite, and also proves that a poisoned attendance document cannot break event deletion.
+4. Review-driven additions: `authorize.js` refuses unknown HTTP methods, non-string `createdBy` and unusable emails; the router reads up to 2000 `att` docs before narrowing so `limit` applies after filtering.
 
 ---
 
@@ -478,7 +480,7 @@ Expected: PASS, 0 fail.
 - Modify: `server/routes.js`
 - Create: `server/routes.test.js`
 
-- [ ] **Step 1: Make the store injectable (no behavior change)**
+- [ ] **Step 1: Make the store injectable and pass `body` / `loadDoc` to `authorize`**
 
 In `server/routes.js` replace
 
@@ -505,6 +507,31 @@ export function apiRouter({ bootstrapAdminEmail, store = db }) {
   const router = express.Router();
 ```
 
+Then, in the same file, replace
+
+```js
+  async function guard(req, res, path) {
+    const rolesDoc = await loadRolesDoc();
+    const ok = await authorize({ method: req.method, path, session: req.session, rolesDoc, bootstrapAdminEmail });
+```
+
+with
+
+```js
+  async function loadDoc(path) {
+    const snap = await getDoc(path);
+    return snap.exists ? snap.data : null;
+  }
+
+  async function guard(req, res, path) {
+    const rolesDoc = await loadRolesDoc();
+    const ok = await authorize({
+      method: req.method, path, session: req.session, rolesDoc, bootstrapAdminEmail, body: req.body, loadDoc,
+    });
+```
+
+Without this, `authorize` throws `loadDoc is not a function` on event writes, and Express 4 does not catch async errors, so the process would die. It is also what makes Step 3 fail on assertions instead of crashing.
+
 - [ ] **Step 2: Write the failing router tests**
 
 Create `server/routes.test.js`:
@@ -529,6 +556,7 @@ const seed = () => ({
   'events/theirs': { title: 'Theirs', start: FUTURE, end: END, createdBy: OTHER },
   'roster/mine': { emails: ['a@x.vn'], map: {} },
   'roster/theirs': { emails: ['b@x.vn'], map: {} },
+  'att/k0': { uid: 'k0', email: 'z@x.vn', records: { theirs: { at: 't' } } },
   'att/ka': { uid: 'ka', email: 'a@x.vn', records: { mine: { at: 't' }, theirs: { at: 't' } } },
   'att/kb': { uid: 'kb', email: 'b@x.vn', records: { theirs: { at: 't' } } },
 });
@@ -546,8 +574,10 @@ function fakeStore() {
     },
     deleteDoc: async (path) => { docs.delete(path); },
     deleteEventCascade: async (id) => { cascaded.push(id); docs.delete(`events/${id}`); docs.delete(`roster/${id}`); },
-    listCollection: async (prefix) => [...docs.entries()]
+    listCollection: async (prefix, limit = 500) => [...docs.entries()]
       .filter(([k]) => k.startsWith(`${prefix}/`) && !k.slice(prefix.length + 1).includes('/'))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(0, limit)
       .map(([k, data]) => ({ id: k.split('/').pop(), exists: true, data })),
   };
 }
@@ -569,6 +599,7 @@ async function withApi(fn) {
     method,
     headers: { 'content-type': 'application/json', ...(email ? { 'x-test-email': email } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(5000), // a hung request fails the test instead of hanging the run
   });
   try {
     await fn({ call, store });
@@ -585,10 +616,18 @@ test('GET att: a manager sees only records of events they created, an admin sees
     assert.deepEqual(Object.keys(mgr.docs[0].data.records), ['mine']);
 
     const adm = await (await call(ADMIN, 'GET', 'collection/att')).json();
-    assert.deepEqual(adm.docs.map((d) => d.id).sort(), ['ka', 'kb']);
+    assert.deepEqual(adm.docs.map((d) => d.id).sort(), ['k0', 'ka', 'kb']);
     assert.deepEqual(Object.keys(adm.docs.find((d) => d.id === 'ka').data.records).sort(), ['mine', 'theirs']);
 
     assert.equal((await call(GUEST, 'GET', 'collection/att')).status, 403);
+
+    // The listing is cut to `limit` after filtering, not before: k0 sorts first but holds nothing of OWNER's.
+    const cut = await (await call(OWNER, 'GET', 'collection/att?limit=1')).json();
+    assert.deepEqual(cut.docs.map((d) => d.id), ['ka']);
+
+    // Only the attendance list is narrowed.
+    const evs = await (await call(OWNER, 'GET', 'collection/events')).json();
+    assert.equal(evs.docs.length, 2);
   });
 });
 
@@ -644,7 +683,7 @@ test('roster and att of other people are closed to a manager', async () => {
 - [ ] **Step 3: Run the tests and confirm they fail**
 
 Run: `npm test`
-Expected: FAIL. The router tests fail on assertions: the collection returns unfiltered `att`, no cascade is recorded, and other managers' writes are not refused, because `guard` still ignores `body` and `loadDoc`. (Fast failures, no hang: the store is fake.)
+Expected: FAIL on assertions (not a crash): 'GET att' (the list is unfiltered) and the two 'DELETE event' tests that expect a cascade (`store.cascaded` stays empty). The other router tests already pass, because Step 1 wired `authorize` correctly.
 
 - [ ] **Step 4: Add `deleteEventCascade` to `server/db.js`**
 
@@ -653,10 +692,13 @@ In `server/db.js`, after the `deleteDoc` function and before the `listCollection
 ```js
 // One statement, so the event, its roster and every attendee's record of it go together or not
 // at all. (A data-modifying WITH runs to completion even though the main query never reads it.)
+// An attendee can store any JSON in their own document, so only touch a `records` that really
+// is an object: `?` also matches array elements, and `#-` on an array would fail the whole statement.
 const CASCADE_SQL = `
   WITH gone AS (DELETE FROM documents WHERE path IN ($2, $3))
   UPDATE documents SET data = data #- ARRAY['records', $1::text], updated_at = now()
-  WHERE path LIKE 'att/%' AND path NOT LIKE 'att/%/%' AND jsonb_exists(data->'records', $1::text)`;
+  WHERE path LIKE 'att/%' AND path NOT LIKE 'att/%/%'
+    AND jsonb_typeof(data->'records') = 'object' AND data->'records' ? $1::text`;
 
 /** Deletes an event with everything that hangs off it: its roster and each attendee's record of it. */
 export async function deleteEventCascade(eventId) {
@@ -732,10 +774,12 @@ In `server/routes.js` replace everything from `async function loadRolesDoc()` to
     const role = await guard(req, res, path);
     if (!role) return;
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit) || 500));
-    let docs = await listCollection(path, limit);
     // A manager sees attendance only for the events they created; an admin sees everything.
-    if (path === 'att' && !role.isAdmin) {
-      docs = filterAttRecords(docs, eventIdsOwnedBy(await listCollection('events', 2000), req.session.email));
+    // Filtering happens after the fetch, so read the maximum and cut to `limit` afterwards.
+    const narrowed = path === 'att' && !role.isAdmin;
+    let docs = await listCollection(path, narrowed ? 2000 : limit);
+    if (narrowed) {
+      docs = filterAttRecords(docs, eventIdsOwnedBy(await listCollection('events', 2000), req.session.email)).slice(0, limit);
     }
     res.json({ docs });
   });
@@ -751,73 +795,84 @@ Expected: PASS — `server/authorize.test.js` and `server/routes.test.js`, 0 fai
 
 ---
 
-### Task 5: Verify the cascade SQL against a real Postgres engine
+### Task 5: Verify the cascade SQL against real Postgres (Docker)
 
-`deleteEventCascade` is the one piece the fake store cannot exercise. The Docker daemon may be off, so use PGlite (Postgres compiled to WASM) installed in the scratchpad, outside the project. Tell the user you installed a package there.
+Docker Desktop is running, so use the same image as `docker-compose.yml`. Everything here is throwaway: a container named `vpu-test-pg` on host port 55432 and a script in the scratchpad. The script imports the project's real `server/db.js`, so it also covers the `pg` pool wiring.
 
 **Files:**
 - Create (scratchpad only): `verify-cascade.mjs`
 
-- [ ] **Step 1: Install PGlite in the scratchpad**
-
-Run:
+- [ ] **Step 1: Start Postgres and load the schema**
 
 ```bash
-SCRATCH="/c/Users/sonph/AppData/Local/Temp/claude/D--Armitage-cyberrange/59a08cae-7941-42e8-bfb9-ff1bd3542ec5/scratchpad"
-npm install --prefix "$SCRATCH" @electric-sql/pglite
+docker run -d --name vpu-test-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=vpu -p 55432:5432 postgres:15-alpine
 ```
 
-Expected: install finishes without errors.
+Poll `docker exec vpu-test-pg pg_isready -U postgres -d vpu` until it prints `accepting connections` (the image restarts once during init, so repeat it after a couple of seconds if the first success is followed by a failure). Then:
+
+```bash
+docker exec -i vpu-test-pg psql -U postgres -d vpu < init-db.sql
+```
+
+Expected: `CREATE TABLE` printed twice.
 
 - [ ] **Step 2: Write the verification script**
 
-Create `$SCRATCH/verify-cascade.mjs` (use the Windows path `C:\Users\sonph\AppData\Local\Temp\claude\D--Armitage-cyberrange\59a08cae-7941-42e8-bfb9-ff1bd3542ec5\scratchpad\verify-cascade.mjs`). Set `DB_JS` to the project's `server/db.js`:
+Create `C:\Users\sonph\AppData\Local\Temp\claude\D--Armitage-cyberrange\59a08cae-7941-42e8-bfb9-ff1bd3542ec5\scratchpad\verify-cascade.mjs`:
 
 ```js
-import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { PGlite } from '@electric-sql/pglite';
 
-const DB_JS = 'G:/Research/NCKH2027/De tai VPU2027/Claude outputs/vpu-checkin/server/db.js';
-// Take the SQL straight from the production file so this checks the real statement.
-const sql = readFileSync(DB_JS, 'utf8').match(/const CASCADE_SQL = `([\s\S]*?)`;/)[1];
+// db.js builds its pool from DATABASE_URL at import time, so set it first.
+process.env.DATABASE_URL = 'postgresql://postgres:test@localhost:55432/vpu';
+const db = await import('file:///G:/Research/NCKH2027/De%20tai%20VPU2027/Claude%20outputs/vpu-checkin/server/db.js');
 
-const db = new PGlite();
-await db.exec(`CREATE TABLE documents (
-  path TEXT PRIMARY KEY, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`);
-const put = (path, data) => db.query('INSERT INTO documents (path, data) VALUES ($1, $2::jsonb)', [path, JSON.stringify(data)]);
+await db.setDoc('events/e1', { title: 'one' });
+await db.setDoc('events/e2', { title: 'two' });
+await db.setDoc('roster/e1', { emails: ['a@x.vn'] });
+await db.setDoc('roster/e2', { emails: ['b@x.vn'] });
+await db.setDoc('att/ka', { uid: 'ka', records: { e1: { at: 1 }, e2: { at: 2 } } });
+await db.setDoc('att/kb', { uid: 'kb', records: { e1: { at: 3 } } });
+await db.setDoc('att/kc', { uid: 'kc', records: { e2: { at: 4 } } });
+await db.setDoc('att/kd/nested', { uid: 'kd', records: { e1: { at: 5 } } }); // deeper path: left alone
+// An attendee can store any JSON in their own document. These must neither be touched
+// nor make the delete fail (that would block deleting the event and crash the server).
+await db.setDoc('att/kp1', { uid: 'kp1', records: ['e1'] });
+await db.setDoc('att/kp2', { uid: 'kp2', records: 'e1' });
+await db.setDoc('att/kp3', { uid: 'kp3' });
+await db.setDoc('config/roles', { entries: [] });
 
-await put('events/e1', { title: 'one' });
-await put('events/e2', { title: 'two' });
-await put('roster/e1', { emails: ['a@x.vn'] });
-await put('roster/e2', { emails: ['b@x.vn'] });
-await put('att/ka', { uid: 'ka', records: { e1: { at: 1 }, e2: { at: 2 } } });
-await put('att/kb', { uid: 'kb', records: { e1: { at: 3 } } });
-await put('att/kc', { uid: 'kc', records: { e2: { at: 4 } } });
-await put('att/kd/nested', { uid: 'kd', records: { e1: { at: 5 } } }); // deeper path must be left alone
-await put('config/roles', { entries: [] });
+await db.deleteEventCascade('e1');
 
-await db.query(sql, ['e1', 'events/e1', 'roster/e1']);
+const { rows } = await db.pool.query('SELECT path, data FROM documents ORDER BY path');
+const rest = Object.fromEntries(rows.map((r) => [r.path, r.data]));
 
-const { rows } = await db.query('SELECT path, data FROM documents ORDER BY path');
-const byPath = Object.fromEntries(rows.map((r) => [r.path, r.data]));
+assert.deepEqual(Object.keys(rest).sort(),
+  ['att/ka', 'att/kb', 'att/kc', 'att/kd/nested', 'att/kp1', 'att/kp2', 'att/kp3', 'config/roles', 'events/e2', 'roster/e2']);
+assert.deepEqual(Object.keys(rest['att/ka'].records), ['e2']);
+assert.deepEqual(rest['att/kb'].records, {});
+assert.deepEqual(Object.keys(rest['att/kc'].records), ['e2']);
+assert.deepEqual(Object.keys(rest['att/kd/nested'].records), ['e1']);
+assert.deepEqual(rest['att/kp1'].records, ['e1']);
+assert.equal(rest['att/kp2'].records, 'e1');
 
-assert.deepEqual(Object.keys(byPath).sort(),
-  ['att/ka', 'att/kb', 'att/kc', 'att/kd/nested', 'config/roles', 'events/e2', 'roster/e2']);
-assert.deepEqual(Object.keys(byPath['att/ka'].records), ['e2']);
-assert.deepEqual(byPath['att/kb'].records, {});
-assert.deepEqual(Object.keys(byPath['att/kc'].records), ['e2']);
-assert.deepEqual(Object.keys(byPath['att/kd/nested'].records), ['e1']);
-console.log('cascade SQL OK');
+// Deleting an id nobody references is a harmless no-op.
+await db.deleteEventCascade('does-not-exist');
+
+console.log('cascade SQL OK on real Postgres');
+await db.pool.end();
 ```
 
 - [ ] **Step 3: Run it**
 
-Run: `node "$SCRATCH/verify-cascade.mjs"`
-Expected: prints `cascade SQL OK`.
-If Postgres rejects the statement (syntax or parameter typing), fix `CASCADE_SQL` in `server/db.js` and rerun until it passes; the regex in the script always re-reads the current text.
+Run: `node "C:/Users/sonph/AppData/Local/Temp/claude/D--Armitage-cyberrange/59a08cae-7941-42e8-bfb9-ff1bd3542ec5/scratchpad/verify-cascade.mjs"`
+Expected: prints `cascade SQL OK on real Postgres`.
+If Postgres rejects the statement, fix `CASCADE_SQL` in `server/db.js` (and re-run Task 4's tests) until it passes.
 
-Note: this exercises the exact SQL on a real Postgres engine, but not the `pg` pool wiring in `deleteEventCascade` (one `pool.query` call). Say so in the final report.
+- [ ] **Step 4: Remove the container**
+
+Run: `docker rm -f vpu-test-pg`
+Expected: prints `vpu-test-pg`.
 
 ---
 

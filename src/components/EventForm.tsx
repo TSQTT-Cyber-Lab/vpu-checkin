@@ -7,27 +7,33 @@ import { Notice } from '@/components/bits';
 import type { Platform } from '@/lib/platform';
 import {
   DEFAULT_RADIUS, DEFAULT_TOLERANCE, DEFAULT_WINDOW, WINDOW_PRESETS, windowLabel, MAX_TOLERANCE, TOLERANCE_PRESETS, type EventDoc, emailsFromFile, extractEmails, getBestPosition,
-  newEventId, parseMapCoordinates, resolveEmails, toLocalInput, uidsOf,
+  newEventId, parseMapCoordinates, resolveEmails, toLocalInput, toleranceOf, uidsOf, type EventRow, type RosterDoc,
 } from '@/lib/domain';
 import { hashEmails, type Session } from '@/lib/auth';
 
 type Msg = { tone: 'ok' | 'bad' | 'info'; text: string } | null;
 
-export function EventForm({ p, session, onCreated, onCancel }: {
-  p: Platform; session: Session; onCreated: (id: string) => void; onCancel: () => void;
+/** The stored ISO time when the form value still means the same minute, so an untouched field keeps its exact stored value. */
+const keepIfSameMinute = (input: string, saved: string | undefined, fresh: Date) =>
+  saved && input === toLocalInput(new Date(saved)) ? saved : fresh.toISOString();
+
+/** Creates an event, or — when `initial` is given — edits that event in place (same id, creator and QR link). */
+export function EventForm({ p, session, initial, onSaved, onCancel }: {
+  p: Platform; session: Session; initial?: { event: EventRow; roster: RosterDoc }; onSaved: (id: string) => void; onCancel: () => void;
 }) {
+  const [ev0] = useState(initial?.event); // fixed when the form opens: the parent re-renders with fresh objects every few seconds
   const openedAt = useRef(new Date());
-  const [title, setTitle] = useState('');
-  const [location, setLocation] = useState('');
-  const [start, setStart] = useState(() => toLocalInput(new Date(Date.now() + 5 * 60e3)));
-  const [end, setEnd] = useState(() => toLocalInput(new Date(Date.now() + 95 * 60e3)));
-  const [lat, setLat] = useState('');
-  const [lng, setLng] = useState('');
-  const [radius, setRadius] = useState(String(DEFAULT_RADIUS));
-  const [tolerance, setTolerance] = useState(String(DEFAULT_TOLERANCE));
-  const [win, setWin] = useState<number>(DEFAULT_WINDOW);
+  const [title, setTitle] = useState(ev0?.title ?? '');
+  const [location, setLocation] = useState(ev0?.location ?? '');
+  const [start, setStart] = useState(() => toLocalInput(ev0 ? new Date(ev0.start) : new Date(Date.now() + 5 * 60e3)));
+  const [end, setEnd] = useState(() => toLocalInput(ev0 ? new Date(ev0.end) : new Date(Date.now() + 95 * 60e3)));
+  const [lat, setLat] = useState(ev0 ? String(ev0.lat) : '');
+  const [lng, setLng] = useState(ev0 ? String(ev0.lng) : '');
+  const [radius, setRadius] = useState(String(ev0?.radius ?? DEFAULT_RADIUS));
+  const [tolerance, setTolerance] = useState(String(ev0 ? toleranceOf(ev0) : DEFAULT_TOLERANCE));
+  const [win, setWin] = useState<number>(ev0 ? ev0.window ?? 0 : DEFAULT_WINDOW);
   const [mapText, setMapText] = useState('');
-  const [emailsText, setEmailsText] = useState('');
+  const [emailsText, setEmailsText] = useState(initial?.roster.emails.join('\n') ?? '');
   const [msg, setMsg] = useState<Msg>(null);
   const [saving, setSaving] = useState(false);
   const [progress, setProgress] = useState<[number, number] | null>(null);
@@ -90,7 +96,9 @@ export function EventForm({ p, session, onCreated, onCancel }: {
     const floorMinute = new Date(created.getTime());
     floorMinute.setSeconds(0, 0);
     if (!title.trim()) return setMsg({ tone: 'bad', text: 'Nhập tên cuộc họp hoặc buổi học.' });
-    if (isNaN(s.getTime()) || s < floorMinute) return setMsg({ tone: 'bad', text: 'Giờ bắt đầu không được sớm hơn thời điểm tạo điểm danh.' });
+    // Editing an event that already started (admin) must not trip over its own past start time.
+    const startChanged = !ev0 || start !== toLocalInput(new Date(ev0.start));
+    if (isNaN(s.getTime()) || (startChanged && s < floorMinute)) return setMsg({ tone: 'bad', text: 'Giờ bắt đầu không được sớm hơn thời điểm tạo điểm danh.' });
     if (isNaN(e.getTime()) || e <= s) return setMsg({ tone: 'bad', text: 'Giờ kết thúc phải sau giờ bắt đầu.' });
     if (!lat || !lng || !isFinite(la) || !isFinite(ln) || Math.abs(la) > 90 || Math.abs(ln) > 180) return setMsg({ tone: 'bad', text: 'Tọa độ phòng chưa hợp lệ: vĩ độ trong [-90, 90], kinh độ trong [-180, 180].' });
     if (!isFinite(r) || r < 10 || r > 500) return setMsg({ tone: 'bad', text: 'Bán kính cho phép từ 10 đến 500 m.' });
@@ -99,7 +107,7 @@ export function EventForm({ p, session, onCreated, onCancel }: {
 
     setSaving(true);
     try {
-      const id = newEventId();
+      const id = ev0?.id ?? newEventId();
       // Eligibility runs on the hashed list; the directory lookup is only a
       // convenience for managers and must not block creating the event.
       const emailHashes = await hashEmails(emails);
@@ -109,17 +117,19 @@ export function EventForm({ p, session, onCreated, onCancel }: {
       } catch {
         map = Object.fromEntries(emails.map((m) => [m, null]));
       }
+      // A search that fails or finds nothing must not erase a match the event already had.
+      map = Object.fromEntries(emails.map((m) => [m, map[m] ?? initial?.roster.map[m] ?? null]));
       const uids = uidsOf(map);
       const doc: EventDoc = {
         title: title.trim(), location: location.trim(),
-        start: s.toISOString(), end: e.toISOString(),
+        start: keepIfSameMinute(start, ev0?.start, s), end: keepIfSameMinute(end, ev0?.end, e),
         lat: la, lng: ln, radius: Math.round(r), tolerance: Math.round(tol), window: win,
         uids, emailHashes, invited: emails.length, unresolved: emails.filter((m) => !map[m]).length,
-        createdAt: created.toISOString(), createdBy: session.email,
+        createdAt: ev0?.createdAt ?? created.toISOString(), createdBy: ev0 ? ev0.createdBy : session.email,
       };
       await p.db.doc(`roster/${id}`).set({ emails, map });
       await p.db.doc(`events/${id}`).set(doc as unknown as Record<string, unknown>);
-      onCreated(id);
+      onSaved(id);
     } catch (err: any) {
       setMsg({
         tone: 'bad',
@@ -148,7 +158,7 @@ export function EventForm({ p, session, onCreated, onCancel }: {
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="grid gap-1.5">
             <Label htmlFor="f-start">Bắt đầu</Label>
-            <Input id="f-start" type="datetime-local" value={start} min={toLocalInput(openedAt.current)}
+            <Input id="f-start" type="datetime-local" value={start} min={ev0 ? undefined : toLocalInput(openedAt.current)}
               onChange={(e) => { setStart(e.target.value); }} />
           </div>
           <div className="grid gap-1.5">
@@ -238,7 +248,7 @@ export function EventForm({ p, session, onCreated, onCancel }: {
 
       <div className="flex flex-wrap justify-end gap-2 border-t pt-4">
         <Button type="button" variant="ghost" onClick={onCancel}>Hủy</Button>
-        <Button type="submit" disabled={saving}>{saving ? (progress ? `Đang đối chiếu tài khoản ${progress[0]}/${progress[1]}…` : 'Đang lưu…') : 'Tạo sự kiện và mã QR'}</Button>
+        <Button type="submit" disabled={saving}>{saving ? (progress ? `Đang đối chiếu tài khoản ${progress[0]}/${progress[1]}…` : 'Đang lưu…') : ev0 ? 'Lưu thay đổi' : 'Tạo sự kiện và mã QR'}</Button>
       </div>
     </form>
   );

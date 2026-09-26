@@ -11,7 +11,7 @@ import {
   type AttendeeDoc, type EventRow, type RosterDoc, MAX_TOLERANCE, TOLERANCE_PRESETS, WINDOW_PRESETS,
   checkinEndMs, csvEscape, fmtClock, fmtRange, fmtRemaining, fmtTime, fmtWindow, phaseOf, slugify, toleranceOf, windowLabel,
 } from '@/lib/domain';
-import { normalizeEmail, type Session } from '@/lib/auth';
+import { canEditEvent, isEventOwner, normalizeEmail, type Session } from '@/lib/auth';
 import { BRAND, inviteText, renderQrCard } from '@/lib/qrcard';
 import { cn } from '@/lib/utils';
 
@@ -32,18 +32,22 @@ export function AdminView({ p, session, events, now, baseUrl, onBaseUrl }: {
     (e) => setAttErr(e?.message || 'Không đọc được dữ liệu điểm danh.'),
   ), [p]);
 
+  // An admin runs every event; a manager runs only the ones they created. Other managers'
+  // events reach them through the check-in tab, like any attendee's.
+  const mine = useMemo(() => (session.isAdmin ? events : events.filter((e) => isEventOwner(e, session))), [events, session]);
+
   const sorted = useMemo(() => {
     const rank = { open: 0, upcoming: 1, closed: 2 } as const;
-    return [...events].sort((a, b) => rank[phaseOf(a, now)] - rank[phaseOf(b, now)]
+    return [...mine].sort((a, b) => rank[phaseOf(a, now)] - rank[phaseOf(b, now)]
       || (phaseOf(a, now) === 'closed' ? Date.parse(b.end) - Date.parse(a.end) : Date.parse(a.start) - Date.parse(b.start)));
-  }, [events, now]);
+  }, [mine, now]);
 
   useEffect(() => {
-    if (!selectedId || !events.some((e) => e.id === selectedId)) setSelectedId(sorted[0]?.id ?? null);
-  }, [sorted, events, selectedId]);
+    if (!selectedId || !mine.some((e) => e.id === selectedId)) setSelectedId(sorted[0]?.id ?? null);
+  }, [sorted, mine, selectedId]);
 
   const countFor = (id: string) => attendees.filter((a) => a.records?.[id]).length;
-  const selected = events.find((e) => e.id === selectedId) ?? null;
+  const selected = mine.find((e) => e.id === selectedId) ?? null;
 
   // The manager's own sign-in doubles as the Google Drive connection.
   useEffect(() => p.google.subscribe(setDrive), [p]);
@@ -100,7 +104,7 @@ export function AdminView({ p, session, events, now, baseUrl, onBaseUrl }: {
           )}
 
           <div className="flex items-center justify-between gap-2">
-            <div className="eyebrow">Sự kiện · {events.length}</div>
+            <div className="eyebrow">Sự kiện · {mine.length}</div>
             <Button size="sm" onClick={() => setCreating(true)}>Tạo sự kiện</Button>
           </div>
           {sorted.length === 0 ? (
@@ -144,7 +148,7 @@ export function AdminView({ p, session, events, now, baseUrl, onBaseUrl }: {
         <section className="min-w-0">
           {attErr && <Notice tone="bad" className="mb-3" title="Không tải được danh sách có mặt">{attErr}</Notice>}
           {selected ? (
-            <EventDetail key={selected.id} p={p} ev={selected} now={now} attendees={attendees} baseUrl={baseUrl} onDeleted={() => setSelectedId(null)} driveReady={!!drive} />
+            <EventDetail key={selected.id} p={p} session={session} ev={selected} now={now} attendees={attendees} baseUrl={baseUrl} onDeleted={() => setSelectedId(null)} driveReady={!!drive} />
           ) : (
             <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">Chọn hoặc tạo một sự kiện.</div>
           )}
@@ -156,7 +160,7 @@ export function AdminView({ p, session, events, now, baseUrl, onBaseUrl }: {
             <DialogTitle>Tạo sự kiện điểm danh</DialogTitle>
             <DialogDescription>Mã QR được sinh ngay sau khi lưu. Người tham dự chỉ thấy tên sự kiện, không thấy danh sách email.</DialogDescription>
           </DialogHeader>
-          <EventForm p={p} session={session} onCancel={() => setCreating(false)} onCreated={(id) => { setCreating(false); setSelectedId(id); }} />
+          <EventForm p={p} session={session} onCancel={() => setCreating(false)} onSaved={(id) => { setCreating(false); setSelectedId(id); }} />
         </DialogContent>
       </Dialog>
     </div>
@@ -204,8 +208,8 @@ function LinkSetting({ baseUrl, onSave }: { baseUrl: string; onSave: (u: string)
 
 type Row = { key: string; email: string; name?: string; at?: string; dist?: number; acc?: number; limit?: number; uid: string | null; invited: boolean };
 
-function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: {
-  p: Platform; ev: EventRow; now: number; attendees: AttendeeDoc[]; baseUrl: string; onDeleted: () => void; driveReady: boolean;
+function EventDetail({ p, session, ev, now, attendees, baseUrl, onDeleted, driveReady }: {
+  p: Platform; session: Session; ev: EventRow; now: number; attendees: AttendeeDoc[]; baseUrl: string; onDeleted: () => void; driveReady: boolean;
 }) {
   const [roster, setRoster] = useState<RosterDoc | null>(null);
   const [qr, setQr] = useState('');
@@ -220,6 +224,7 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
   const [cardOpen, setCardOpen] = useState(false);
   const [cardBusy, setCardBusy] = useState(false);
   const [copyFallback, setCopyFallback] = useState<{ title: string; text: string } | null>(null);
+  const [editing, setEditing] = useState(false);
 
   async function changeWindow(m: number) {
     if ((ev.window ?? 0) === m) return;
@@ -261,7 +266,7 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
 
   useEffect(() => p.db.doc(`roster/${ev.id}`).onSnapshot(
     (s) => setRoster(s.exists ? { ...(s.data() as RosterDoc) } : { emails: [], map: {} }),
-    () => setRoster({ emails: [], map: {} }),
+    () => {}, // a failed poll keeps the last good list: faking an empty one would open the edit form with no invitees
   ), [p, ev.id]);
 
   useEffect(() => {
@@ -354,6 +359,7 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
   const nOutside = rows.filter((r) => r.at && !r.invited).length;
   const shown = rows.filter((r) => filter === 'all' || (filter === 'present' ? !!r.at : !r.at));
   const phase = phaseOf(ev, now);
+  const canEdit = canEditEvent(ev, session, now);
 
   async function exportCsv() {
     const head = ['STT', 'Email', 'Tên tài khoản', 'Trạng thái', 'Thời điểm điểm danh', 'Khoảng cách (m)', 'Sai số GPS (m)', 'Ngưỡng áp dụng (m)', 'Ghi chú'];
@@ -395,19 +401,10 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
 
   async function remove() {
     try {
-      // 1. Xoá event và roster
       await p.db.doc(`events/${ev.id}`).delete();
+      // The backend has already removed the roster and every attendee's record of this event; the
+      // in-memory preview and the claude.ai runtime have no server, so make sure the invite list goes too.
       await p.db.doc(`roster/${ev.id}`).delete();
-
-      // 2. Dọn dẹp attendance records: xoá ev.id khỏi records của mỗi attendee
-      for (const att of attendees) {
-        if (att.records?.[ev.id]) {
-          const updatedRecords = { ...att.records };
-          delete updatedRecords[ev.id];
-          await p.db.doc(`att/${att.uid}`).update({ records: updatedRecords });
-        }
-      }
-
       onDeleted();
     } catch (e: any) {
       setNote({ tone: 'bad', text: e?.message || 'Không xóa được sự kiện.' });
@@ -431,6 +428,7 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={roster === null}>Xuất CSV</Button>
+          {canEdit && <Button variant="outline" size="sm" onClick={() => setEditing(true)} disabled={roster === null}>Sửa sự kiện</Button>}
           {confirmDel ? (
             <>
               <Button variant="destructive" size="sm" onClick={remove}>Xác nhận xóa</Button>
@@ -442,6 +440,11 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
         </div>
       </header>
       {note && <Notice tone={note.tone}>{note.text}</Notice>}
+      {!canEdit && (
+        <p className="text-[13px] text-muted-foreground">
+          Sự kiện đã bắt đầu nên không sửa được nội dung. Bạn vẫn chỉnh được thời gian nhận điểm danh và sai số GPS.
+        </p>
+      )}
 
       <div className="grid gap-5 md:grid-cols-[250px_minmax(0,1fr)]">
         {/* QR */}
@@ -570,6 +573,22 @@ function EventDetail({ p, ev, now, attendees, baseUrl, onDeleted, driveReady }: 
           </div>
         </div>
       </div>
+
+      <Dialog open={editing} onOpenChange={setEditing}>
+        <DialogContent className="max-h-[92dvh] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Sửa sự kiện điểm danh</DialogTitle>
+            <DialogDescription>Liên kết mã QR không đổi. Nếu đổi giờ hoặc phòng, ảnh QR đã gửi trước đó vẫn ghi thông tin cũ.</DialogDescription>
+          </DialogHeader>
+          {roster && (
+            <EventForm p={p} session={session} initial={{ event: ev, roster }} onCancel={() => setEditing(false)}
+              onSaved={() => {
+                setEditing(false);
+                setNote({ tone: 'ok', text: 'Đã lưu thay đổi. Nếu bạn đổi giờ hoặc phòng, hãy tải lại ảnh QR và gửi lại cho thành viên.' });
+              }} />
+          )}
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={projector} onOpenChange={setProjector}>
         <DialogContent className="max-w-[min(92vw,720px)]">

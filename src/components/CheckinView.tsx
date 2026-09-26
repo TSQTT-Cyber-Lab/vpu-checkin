@@ -38,7 +38,7 @@ export function CheckinView({ p, session, events, now, preferredId }: {
 
   const attKey = myHash ? attKeyOf(myHash) : null;
 
-  // Own attendance doc (private to this viewer + managers).
+  // Own attendance doc (private to this viewer + admins; a manager sees others' records only through the filtered list).
   useEffect(() => {
     if (!attKey) { setMyDoc(null); return; }
     return p.db.doc(`att/${attKey}`).onSnapshot(

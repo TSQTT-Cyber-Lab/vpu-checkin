@@ -60,6 +60,21 @@ export async function deleteDoc(path) {
   await pool.query('DELETE FROM documents WHERE path = $1', [path]);
 }
 
+// One statement, so the event, its roster and every attendee's record of it go together or not
+// at all. (A data-modifying WITH runs to completion even though the main query never reads it.)
+// An attendee can store any JSON in their own document, so only touch a `records` that really
+// is an object: `?` also matches array elements, and `#-` on an array would fail the whole statement.
+const CASCADE_SQL = `
+  WITH gone AS (DELETE FROM documents WHERE path IN ($2, $3))
+  UPDATE documents SET data = data #- ARRAY['records', $1::text], updated_at = now()
+  WHERE path LIKE 'att/%' AND path NOT LIKE 'att/%/%'
+    AND jsonb_typeof(data->'records') = 'object' AND data->'records' ? $1::text`;
+
+/** Deletes an event with everything that hangs off it: its roster and each attendee's record of it. */
+export async function deleteEventCascade(eventId) {
+  await pool.query(CASCADE_SQL, [eventId, `events/${eventId}`, `roster/${eventId}`]);
+}
+
 /** Every document one level deeper than `prefix` — e.g. prefix "events" matches "events/ev-1", not "events/ev-1/x". */
 export async function listCollection(prefix, limit) {
   const { rows } = await pool.query(

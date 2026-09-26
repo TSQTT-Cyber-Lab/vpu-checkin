@@ -2,7 +2,8 @@
 //
 // The app has three roles:
 //   admin    — the artifact owner, plus any email granted 'admin'. Can appoint managers.
-//   manager  — can create events and issue QR cards.
+//   manager  — can create events and issue QR cards, and run the events they created (full edit
+//              only before it starts, delete any time). Other managers' events are theirs to attend only.
 //   attendee — must sign in; check-in is accepted only when the signed-in email
 //              is on the event's invite list.
 //
@@ -120,4 +121,17 @@ export function resolveSession(args: {
     isManager: isAdmin || (!!email && entry?.role === 'manager'),
     canWrite: args.canEdit || args.isOwner,
   };
+}
+
+/** The manager who created the event; an event with no recorded creator belongs to nobody. */
+export function isEventOwner(ev: { createdBy: string | null }, session: Session): boolean {
+  return !!ev.createdBy && !!session.email && normalizeEmail(ev.createdBy) === normalizeEmail(session.email);
+}
+
+/**
+ * Full edits (name, room, times, location, invite list): an admin any time, the creator only
+ * before the event starts. Mirrors server/authorize.js, which is what actually enforces it.
+ */
+export function canEditEvent(ev: { createdBy: string | null; start: string }, session: Session, now: number): boolean {
+  return session.isAdmin || (isEventOwner(ev, session) && now < Date.parse(ev.start));
 }
