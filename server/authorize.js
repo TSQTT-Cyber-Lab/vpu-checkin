@@ -7,8 +7,10 @@
 //              edit or delete any event; a new event is always created under its creator's own email.
 // roster/<id>  The plaintext invite list: its event's creator or an admin only.
 // att/<key>    Attendance, one document per attendee: touched only by that attendee (or an admin).
+//              Their own document accepts only valid, immutable check-in records (see checkin.js).
 //              Managers read the whole list, which the route narrows to their own events.
 // Keep canEditEvent in src/lib/auth.ts in sync with the events rules.
+import { attendanceWriteAllowed } from './checkin.js';
 import { attKeyOf, computeRole, hashEmail, normalizeEmail } from './roles.js';
 
 const QUICK_FIELDS = new Set(['window', 'tolerance']);
@@ -22,6 +24,28 @@ function notStarted(eventDoc, now) {
   return now < Date.parse(eventDoc.start);
 }
 
+/**
+ * A roles list every reader survives and that keeps the bootstrap admin: plain objects with a string email and a
+ * known role, no address twice, and `locked` only on the bootstrap entry, which must be an admin.
+ * (One junk entry would make every request throw in computeRole, and the server could no longer start.)
+ */
+function rolesListValid(entries, bootstrapEmail) {
+  if (!Array.isArray(entries)) return false;
+  const boot = normalizeEmail(bootstrapEmail);
+  const seen = new Set();
+  let bootOk = false;
+  for (const e of entries) {
+    if (!e || typeof e !== 'object' || Array.isArray(e) || typeof e.email !== 'string') return false;
+    if (e.role !== 'admin' && e.role !== 'manager') return false;
+    const addr = normalizeEmail(e.email);
+    if (!addr || seen.has(addr)) return false;
+    seen.add(addr);
+    if (addr === boot) bootOk = e.role === 'admin' && e.locked === true;
+    else if ('locked' in e) return false;
+  }
+  return bootOk;
+}
+
 export async function authorize({ method, path, session, rolesDoc, bootstrapAdminEmail, body, loadDoc, now = Date.now() }) {
   if (!['GET', 'HEAD', 'PUT', 'PATCH', 'DELETE'].includes(method)) return false;
   const isWrite = method !== 'GET' && method !== 'HEAD'; // HEAD is served by the GET handler, so it is a read
@@ -29,9 +53,19 @@ export async function authorize({ method, path, session, rolesDoc, bootstrapAdmi
   const signedIn = !!email;
   const { isAdmin, isManager } = computeRole(rolesDoc, session?.email, bootstrapAdminEmail);
   const segs = path.split('/');
-  if (segs.includes('')) return false; // empty segments (events/, events//x) are never valid ids
+  // Empty segments (events/, events//x) are never valid ids; neither is __proto__, which the deep merge in db.js would drop.
+  if (segs.includes('') || segs.includes('__proto__')) return false;
 
-  if (path === 'config/roles') return isWrite ? isAdmin : signedIn;
+  if (path === 'config/roles') {
+    if (!isWrite) return signedIn;
+    if (!isAdmin) return false;
+    // The bootstrap admin is the escape hatch: no write may remove, demote or unlock its entry (index.js seeds it locked).
+    if (!bootstrapAdminEmail) return true;
+    if (method === 'DELETE') return false;
+    const b = body && typeof body === 'object' ? body : {};
+    if (method === 'PATCH' && !('entries' in b)) return true; // nothing about the entries changes
+    return rolesListValid(b.entries, bootstrapAdminEmail);
+  }
   if (path === 'config/app') return isWrite ? isManager : signedIn;
 
   if (segs[0] === 'events') {
@@ -71,30 +105,14 @@ export async function authorize({ method, path, session, rolesDoc, bootstrapAdmi
     if (segs.length !== 2 || !signedIn) return false;
     if (isAdmin) return true;
     // Everyone else, managers included, may only touch their own record.
-    return path === `att/${attKeyOf(await hashEmail(email))}`;
+    const emailHash = await hashEmail(email);
+    const key = attKeyOf(emailHash);
+    if (path !== `att/${key}`) return false;
+    if (!isWrite) return true;
+    return attendanceWriteAllowed({
+      method, key, existing: await loadDoc(path), body: body && typeof body === 'object' ? body : {}, email, emailHash, now, loadDoc,
+    });
   }
 
   return false;
-}
-
-/** Ids of the events created by `email`, from a listCollection('events') result. */
-export function eventIdsOwnedBy(eventDocs, email) {
-  return eventDocs.filter((d) => isOwner(d.data, email)).map((d) => d.id);
-}
-
-/**
- * What a non-admin manager sees of the attendance list: only the records of the given
- * events, and only the attendees who still have one — nobody else's name or email leaks out.
- */
-export function filterAttRecords(docs, ownedEventIds) {
-  const owned = new Set(ownedEventIds);
-  return docs
-    .map((d) => ({
-      ...d,
-      data: {
-        ...d.data,
-        records: Object.fromEntries(Object.entries(d.data?.records ?? {}).filter(([id]) => owned.has(id))),
-      },
-    }))
-    .filter((d) => Object.keys(d.data.records).length > 0);
 }

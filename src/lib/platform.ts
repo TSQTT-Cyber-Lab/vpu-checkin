@@ -309,6 +309,10 @@ async function apiHealthy(): Promise<boolean> {
 // The server answers 403 for every refusal (expired sign-in, wrong role, not the creator, event already started).
 const FORBIDDEN_MSG = 'Bạn không có quyền thực hiện thao tác này. Hãy đăng nhập lại; nếu đang sửa sự kiện, có thể sự kiện đã bắt đầu hoặc không do bạn tạo.';
 
+// A 403 carries the code 'forbidden' so a caller can explain the refusal in its own words.
+const refused = (r: Response, fallback: string) =>
+  Object.assign(new Error(r.status === 403 ? FORBIDDEN_MSG : `${fallback} (mã ${r.status}).`), { code: r.status === 403 ? 'forbidden' : 'unknown' });
+
 function backendDoc(path: string): DocRef {
   const url = `${API}/doc/${path}`;
   return {
@@ -320,15 +324,15 @@ function backendDoc(path: string): DocRef {
     },
     set: async (d) => {
       const r = await fetch(url, { method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) });
-      if (!r.ok) throw new Error(r.status === 403 ? FORBIDDEN_MSG : `Không lưu được dữ liệu (mã ${r.status}).`);
+      if (!r.ok) throw refused(r, 'Không lưu được dữ liệu');
     },
     update: async (d) => {
       const r = await fetch(url, { method: 'PATCH', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) });
-      if (!r.ok) throw { code: r.status === 404 ? 'invalid_argument' : 'unknown', message: r.status === 403 ? FORBIDDEN_MSG : `Không cập nhật được dữ liệu (mã ${r.status}).` };
+      if (!r.ok) throw { code: r.status === 404 ? 'invalid_argument' : r.status === 403 ? 'forbidden' : 'unknown', message: r.status === 403 ? FORBIDDEN_MSG : `Không cập nhật được dữ liệu (mã ${r.status}).` };
     },
     delete: async () => {
       const r = await fetch(url, { method: 'DELETE', credentials: 'same-origin' });
-      if (!r.ok) throw new Error(r.status === 403 ? FORBIDDEN_MSG : `Không xoá được dữ liệu (mã ${r.status}).`);
+      if (!r.ok) throw refused(r, 'Không xoá được dữ liệu');
     },
     onSnapshot: (next, err) => {
       let stopped = false;

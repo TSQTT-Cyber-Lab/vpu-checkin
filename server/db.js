@@ -75,6 +75,37 @@ export async function deleteEventCascade(eventId) {
   await pool.query(CASCADE_SQL, [eventId, `events/${eventId}`, `roster/${eventId}`]);
 }
 
+/** Ids of the events whose `createdBy` is `email` (compared case-insensitively). */
+export async function listEventIdsCreatedBy(email) {
+  const { rows } = await pool.query(
+    `SELECT substr(path, 8) AS id FROM documents
+     WHERE path LIKE 'events/%' AND path NOT LIKE 'events/%/%'
+       AND jsonb_typeof(data->'createdBy') = 'string'
+       AND lower(regexp_replace(data->>'createdBy', '^\\s+|\\s+$', '', 'g')) = $1`,
+    [String(email ?? '').trim().toLowerCase()],
+  );
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Attendance documents holding a record of any of `eventIds`, reduced to just those records — so a manager
+ * never receives another event's records. Malformed `records` (not an object) are skipped.
+ */
+export async function listAttForEvents(eventIds, limit) {
+  if (!eventIds.length) return [];
+  const { rows } = await pool.query(
+    `SELECT a.path, jsonb_set(a.data, '{records}', (
+              SELECT jsonb_object_agg(r.k, r.v) FROM jsonb_each(a.data->'records') AS r(k, v) WHERE r.k = ANY($1::text[])
+            )) AS data
+     FROM documents a
+     WHERE a.path LIKE 'att/%' AND a.path NOT LIKE 'att/%/%'
+       AND jsonb_typeof(a.data->'records') = 'object' AND a.data->'records' ?| $1::text[]
+     ORDER BY a.path LIMIT $2`,
+    [eventIds, limit],
+  );
+  return rows.map((r) => ({ id: r.path.split('/').pop(), exists: true, data: r.data }));
+}
+
 /** Every document one level deeper than `prefix` — e.g. prefix "events" matches "events/ev-1", not "events/ev-1/x". */
 export async function listCollection(prefix, limit) {
   const { rows } = await pool.query(

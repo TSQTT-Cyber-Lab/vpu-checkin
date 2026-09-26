@@ -19,6 +19,8 @@ export interface RoleEntry {
   role: Role;
   addedAt: string; // ISO
   addedBy: string | null; // email of the admin who granted it
+  /** Set by the server on the BOOTSTRAP_ADMIN_EMAIL entry: it is always an admin and cannot be edited or revoked. */
+  locked?: boolean;
 }
 
 /** Stored at `config/roles`. Bootstrap admin is the artifact owner, always implicit. */

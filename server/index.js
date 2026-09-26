@@ -21,19 +21,33 @@ if (!GOOGLE_CLIENT_ID) {
   console.warn('GOOGLE_CLIENT_ID is not set — sign-in will be unavailable until it is configured.');
 }
 
-/** Ensures BOOTSTRAP_ADMIN_EMAIL always has a real admin entry in config/roles, so the
- * client's normal role resolution (src/lib/auth.ts resolveSession) picks it up without
- * any special-casing — it just looks like any other admin grant. */
+/** Ensures BOOTSTRAP_ADMIN_EMAIL has a real, `locked` admin entry in config/roles. The client reads roles
+ * from that document, so what it shows must match what the server enforces (roles.js always treats this
+ * address as admin, and authorize.js refuses any write that removes, demotes or unlocks the entry).
+ * A stale `locked` flag on any other address (the env var changed) is cleared. */
 async function seedBootstrapAdmin() {
   const snap = await getDoc('config/roles');
   const roles = snap.exists ? snap.data : { entries: [] };
-  const already = roles.entries?.some((e) => normalizeEmail(e.email) === normalizeEmail(BOOTSTRAP_ADMIN_EMAIL));
-  if (already) return;
-  roles.entries = [...(roles.entries ?? []), {
-    email: BOOTSTRAP_ADMIN_EMAIL, name: '', role: 'admin', addedAt: new Date().toISOString(), addedBy: null,
-  }];
-  await setDoc('config/roles', roles);
-  console.log(`Seeded bootstrap admin: ${BOOTSTRAP_ADMIN_EMAIL}`);
+  // Junk (a null, a string, a missing address) is dropped: it would make every request throw.
+  const raw = Array.isArray(roles.entries) ? roles.entries : [];
+  const entries = raw.filter((e) => e && typeof e === 'object' && !Array.isArray(e) && typeof e.email === 'string');
+  const isBoot = (e) => normalizeEmail(e.email) === normalizeEmail(BOOTSTRAP_ADMIN_EMAIL);
+  const settled = Array.isArray(roles.entries) && entries.length === raw.length
+    && entries.filter(isBoot).length === 1
+    && entries.some((e) => isBoot(e) && e.role === 'admin' && e.locked === true)
+    && !entries.some((e) => !isBoot(e) && 'locked' in e);
+  if (settled) return;
+  const others = entries.filter((e) => !isBoot(e)).map((e) => {
+    const rest = { ...e };
+    delete rest.locked;
+    return rest;
+  });
+  const found = entries.find(isBoot);
+  await setDoc('config/roles', {
+    ...roles,
+    entries: [...others, { email: BOOTSTRAP_ADMIN_EMAIL, name: '', addedAt: new Date().toISOString(), addedBy: null, ...found, role: 'admin', locked: true }],
+  });
+  console.log(`Locked bootstrap admin: ${BOOTSTRAP_ADMIN_EMAIL}`);
 }
 
 async function main() {

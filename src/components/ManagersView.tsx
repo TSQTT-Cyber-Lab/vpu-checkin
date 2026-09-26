@@ -24,6 +24,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
   const [note, setNote] = useState<{ tone: 'ok' | 'bad' | 'warn'; text: string } | null>(null);
   const [confirmDrop, setConfirmDrop] = useState<string | null>(null);
   const [editing, setEditing] = useState<string | null>(null); // email of the entry being edited
+  const [confirmDemote, setConfirmDemote] = useState(false);
 
   const entries = useMemo(() => {
     const list = roles?.entries ?? [];
@@ -31,11 +32,19 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
     return [...list].sort((a, b) => rank[a.role] - rank[b.role] || a.email.localeCompare(b.email));
   }, [roles]);
 
+  // A self-hosted server marks its bootstrap admin `locked`; the page-owner row below is only for claude.ai.
+  const hasLocked = entries.some((e) => e.locked);
+
   async function write(next: RoleEntry[]) {
     await p.db.doc('config/roles').set({ entries: next } satisfies RolesDoc as unknown as Record<string, unknown>);
   }
 
+  // An admin lowering their own role loses this console at once, so it takes a second, explicit click.
+  const demotingSelf = !!editing && normalizeEmail(editing) === session.email && role !== 'admin'
+    && roles?.entries.find((e) => normalizeEmail(e.email) === normalizeEmail(editing))?.role === 'admin';
+
   function startEdit(e: RoleEntry) {
+    setConfirmDemote(false);
     setEditing(e.email);
     setEmail(e.email);
     setName(e.name ?? '');
@@ -45,6 +54,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
   }
 
   function cancelEdit() {
+    setConfirmDemote(false);
     setEditing(null);
     setEmail('');
     setName('');
@@ -59,10 +69,17 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
 
     const current = roles?.entries ?? EMPTY_ROLES.entries;
     const existing = current.find((e) => normalizeEmail(e.email) === addr);
+    if (existing?.locked) {
+      return setNote({ tone: 'warn', text: `${addr} là quản trị viên mặc định của máy chủ nên không thể thay đổi.` });
+    }
     if (editing && !existing) {
       // Someone revoked this grant while the form was open: saving must not silently bring it back.
       cancelEdit();
       return setNote({ tone: 'warn', text: `${addr} không còn trong danh sách quyền (có thể vừa bị thu hồi). Hãy thêm lại nếu bạn vẫn muốn cấp quyền.` });
+    }
+    if (demotingSelf && !confirmDemote) {
+      setConfirmDemote(true);
+      return setNote({ tone: 'warn', text: 'Bạn đang hạ vai trò của chính mình xuống người quản lý: bạn sẽ mất tab Quản trị ngay và chỉ một quản trị viên khác mới cấp lại được. Bấm "Xác nhận hạ vai trò" để tiếp tục.' });
     }
     if (!editing && existing?.role === role) {
       return setNote({ tone: 'warn', text: `${addr} đã là ${ROLE_LABEL[role].toLowerCase()}.` });
@@ -85,6 +102,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
       if (editing) {
         setEditing(null);
         setRole('manager');
+        setConfirmDemote(false);
       }
       setNote({
         tone: 'ok',
@@ -134,7 +152,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
             <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-labelledby="r-role-label">
               {(['manager', 'admin'] as const).map((r) => (
                 <Button key={r} type="button" size="sm" role="radio" aria-checked={role === r} className="h-8"
-                  variant={role === r ? 'default' : 'outline'} onClick={() => setRole(r)}>
+                  variant={role === r ? 'default' : 'outline'} onClick={() => { setRole(r); setConfirmDemote(false); }}>
                   {ROLE_LABEL[r]}
                 </Button>
               ))}
@@ -146,7 +164,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button type="submit" disabled={busy || !email.trim()}>{busy ? 'Đang lưu…' : editing ? 'Lưu thay đổi' : 'Thêm người quản lý'}</Button>
+            <Button type="submit" disabled={busy || !email.trim()}>{busy ? 'Đang lưu…' : demotingSelf && confirmDemote ? 'Xác nhận hạ vai trò' : editing ? 'Lưu thay đổi' : 'Thêm người quản lý'}</Button>
             {editing && <Button type="button" variant="ghost" disabled={busy} onClick={cancelEdit}>Huỷ sửa</Button>}
           </div>
         </form>
@@ -163,7 +181,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
         <div className="flex items-end justify-between gap-3">
           <div>
             <div className="eyebrow">Người có quyền</div>
-            <div className="num text-3xl font-bold leading-none">{entries.length + 1}</div>
+            <div className="num text-3xl font-bold leading-none">{entries.length + (hasLocked ? 0 : 1)}</div>
           </div>
         </div>
 
@@ -179,7 +197,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
             </thead>
             <tbody className="divide-y">
               {/* The artifact owner is an admin by construction and cannot be demoted here. */}
-              <tr className="bg-accent/30">
+              {!hasLocked && <tr className="bg-accent/30">
                 <td className="px-3 py-2">
                   <div className="font-medium">{p.me.name || 'Chủ sở hữu trang'}</div>
                   <div className="mono truncate text-[12px] text-muted-foreground">{p.me.email ?? 'Tài khoản sở hữu trang claude.ai'}</div>
@@ -189,7 +207,7 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
                 </td>
                 <td className="px-3 py-2 text-[12px] text-muted-foreground">Mặc định</td>
                 <td className="px-3 py-2 text-right text-[12px] text-muted-foreground">Không thể thu hồi</td>
-              </tr>
+              </tr>}
               {entries.map((e) => {
                 const isSelf = normalizeEmail(e.email) === session.email;
                 return (
@@ -204,7 +222,9 @@ export function ManagersView({ p, session, roles }: { p: Platform; session: Sess
                       {e.addedBy && <div className="mono truncate">bởi {e.addedBy}</div>}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-right">
-                      {confirmDrop === e.email ? (
+                      {e.locked ? (
+                        <span className="text-[12px] text-muted-foreground">Mặc định · không thể sửa hay thu hồi</span>
+                      ) : confirmDrop === e.email ? (
                         <span className="inline-flex gap-1">
                           <Button size="sm" variant="destructive" disabled={busy} onClick={() => drop(e.email)}>Xác nhận</Button>
                           <Button size="sm" variant="ghost" onClick={() => setConfirmDrop(null)}>Huỷ</Button>

@@ -2,12 +2,24 @@
 // contract, with authorize.js enforcing who may read/write each path.
 import express from 'express';
 import * as db from './db.js';
-import { authorize, eventIdsOwnedBy, filterAttRecords } from './authorize.js';
+import { authorize } from './authorize.js';
 import { computeRole } from './roles.js';
+
+// Express 4 does not catch a rejected promise from an async handler, and Node exits on an
+// unhandled rejection: one bad request (or a database hiccup) would take the whole server down.
+const safe = (handler) => (req, res) => {
+  Promise.resolve(handler(req, res)).catch((e) => {
+    console.error(`${req.method} ${req.originalUrl} failed:`, e);
+    if (!res.headersSent) res.status(500).json({ error: 'server_error' });
+  });
+};
+
+// Every stored document is a JSON object; an array would be stored as a Postgres array, not jsonb.
+const isPlainObject = (b) => b !== null && typeof b === 'object' && !Array.isArray(b);
 
 // `store` is injectable so the routes can be tested without Postgres.
 export function apiRouter({ bootstrapAdminEmail, store = db }) {
-  const { deleteDoc, deleteEventCascade, getDoc, listCollection, setDoc, updateDoc } = store;
+  const { deleteDoc, deleteEventCascade, getDoc, listAttForEvents, listCollection, listEventIdsCreatedBy, setDoc, updateDoc } = store;
   const router = express.Router();
 
   async function loadRolesDoc() {
@@ -34,31 +46,33 @@ export function apiRouter({ bootstrapAdminEmail, store = db }) {
   }
 
   // Express 4 string wildcard: req.params[0] holds everything after '/doc/'.
-  router.get('/doc/*', async (req, res) => {
+  router.get('/doc/*', safe(async (req, res) => {
     const path = decodeURIComponent(req.params[0]);
     if (!(await guard(req, res, path))) return;
     res.json(await getDoc(path));
-  });
+  }));
 
-  router.put('/doc/*', async (req, res) => {
+  router.put('/doc/*', safe(async (req, res) => {
     const path = decodeURIComponent(req.params[0]);
     if (!(await guard(req, res, path))) return;
+    if (!isPlainObject(req.body)) return res.status(400).json({ error: 'body must be a JSON object' });
     await setDoc(path, req.body);
     res.json({ ok: true });
-  });
+  }));
 
-  router.patch('/doc/*', async (req, res) => {
+  router.patch('/doc/*', safe(async (req, res) => {
     const path = decodeURIComponent(req.params[0]);
     if (!(await guard(req, res, path))) return;
+    if (!isPlainObject(req.body)) return res.status(400).json({ error: 'body must be a JSON object' });
     try {
       await updateDoc(path, req.body);
       res.json({ ok: true });
     } catch (e) {
       res.status(e.code === 'invalid_argument' ? 404 : 500).json({ error: e.message });
     }
-  });
+  }));
 
-  router.delete('/doc/*', async (req, res) => {
+  router.delete('/doc/*', safe(async (req, res) => {
     const path = decodeURIComponent(req.params[0]);
     if (!(await guard(req, res, path))) return;
     // Deleting an event also removes its roster and every attendee's record of it.
@@ -66,22 +80,19 @@ export function apiRouter({ bootstrapAdminEmail, store = db }) {
     if (eventId) await deleteEventCascade(eventId);
     else await deleteDoc(path);
     res.json({ ok: true });
-  });
+  }));
 
-  router.get('/collection/*', async (req, res) => {
+  router.get('/collection/*', safe(async (req, res) => {
     const path = decodeURIComponent(req.params[0]);
     const role = await guard(req, res, path);
     if (!role) return;
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit) || 500));
-    // A manager sees attendance only for the events they created; an admin sees everything.
-    // Filtering happens after the fetch, so read the maximum and cut to `limit` afterwards.
-    const narrowed = path === 'att' && !role.isAdmin;
-    let docs = await listCollection(path, narrowed ? 2000 : limit);
-    if (narrowed) {
-      docs = filterAttRecords(docs, eventIdsOwnedBy(await listCollection('events', 2000), req.session.email)).slice(0, limit);
-    }
+    // A manager sees attendance only for the events they created (filtered in SQL); an admin sees everything.
+    const docs = path === 'att' && !role.isAdmin
+      ? await listAttForEvents(await listEventIdsCreatedBy(req.session.email), limit)
+      : await listCollection(path, limit);
     res.json({ docs });
-  });
+  }));
 
   return router;
 }

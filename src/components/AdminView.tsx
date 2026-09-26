@@ -225,6 +225,13 @@ function EventDetail({ p, session, ev, now, attendees, baseUrl, onDeleted, drive
   const [cardBusy, setCardBusy] = useState(false);
   const [copyFallback, setCopyFallback] = useState<{ title: string; text: string } | null>(null);
   const [editing, setEditing] = useState(false);
+  // The lists refresh every ~3 s: reopening the form before that would show the pre-save data.
+  const [justSaved, setJustSaved] = useState(false);
+  useEffect(() => {
+    if (!justSaved) return;
+    const t = setTimeout(() => setJustSaved(false), 4000);
+    return () => clearTimeout(t);
+  }, [justSaved]);
 
   async function changeWindow(m: number) {
     if ((ev.window ?? 0) === m) return;
@@ -428,7 +435,7 @@ function EventDetail({ p, session, ev, now, attendees, baseUrl, onDeleted, drive
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" onClick={exportCsv} disabled={roster === null}>Xuất CSV</Button>
-          {canEdit && <Button variant="outline" size="sm" onClick={() => setEditing(true)} disabled={roster === null}>Sửa sự kiện</Button>}
+          {canEdit && <Button variant="outline" size="sm" onClick={() => setEditing(true)} disabled={roster === null || justSaved}>Sửa sự kiện</Button>}
           {confirmDel ? (
             <>
               <Button variant="destructive" size="sm" onClick={remove}>Xác nhận xóa</Button>
@@ -584,6 +591,7 @@ function EventDetail({ p, session, ev, now, attendees, baseUrl, onDeleted, drive
             <EventForm p={p} session={session} initial={{ event: ev, roster }} onCancel={() => setEditing(false)}
               onSaved={() => {
                 setEditing(false);
+                setJustSaved(true);
                 setNote({ tone: 'ok', text: 'Đã lưu thay đổi. Nếu bạn đổi giờ hoặc phòng, hãy tải lại ảnh QR và gửi lại cho thành viên.' });
               }} />
           )}

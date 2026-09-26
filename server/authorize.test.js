@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { authorize, eventIdsOwnedBy, filterAttRecords } from './authorize.js';
+import { authorize } from './authorize.js';
 import { attKeyOf, hashEmail } from './roles.js';
+import { haversine, judgeFix } from './checkin.js';
 
 const ADMIN = 'admin@tbd.edu.vn';
 const OWNER = 'owner@tbd.edu.vn';
@@ -38,10 +39,54 @@ const can = (email, method, path, body) => authorize({
   rolesDoc, bootstrapAdminEmail: 'boot@tbd.edu.vn', loadDoc, now: NOW,
 });
 
+const BOOT_ENTRY = { email: 'boot@tbd.edu.vn', role: 'admin', locked: true };
+
+test('config/roles: no write may remove, demote or unlock the bootstrap admin', async () => {
+  const put = (entries) => can(ADMIN, 'PUT', 'config/roles', { entries });
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER, role: 'manager' }]), true);
+  assert.equal(await put([{ email: OWNER, role: 'manager' }]), false); // removed
+  assert.equal(await put([]), false);
+  assert.equal(await put([{ ...BOOT_ENTRY, role: 'manager' }]), false); // demoted
+  assert.equal(await put([{ email: BOOT_ENTRY.email, role: 'admin' }]), false); // unlocked
+  assert.equal(await put([{ ...BOOT_ENTRY, locked: 'true' }]), false); // must be the boolean true
+  assert.equal(await put([{ ...BOOT_ENTRY, email: 'BOOT@tbd.edu.vn' }]), true); // case-insensitive
+  assert.equal(await put('nope'), false); // entries is not a list
+  // A list every reader must survive: junk entries, unknown roles, repeated addresses or a stray lock are refused.
+  assert.equal(await put([null, BOOT_ENTRY]), false);
+  assert.equal(await put([BOOT_ENTRY, 'x']), false);
+  assert.equal(await put([BOOT_ENTRY, [1]]), false);
+  assert.equal(await put([BOOT_ENTRY, { role: 'manager' }]), false); // no address
+  assert.equal(await put([BOOT_ENTRY, { email: 42, role: 'manager' }]), false);
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER, role: 'owner' }]), false); // unknown role
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER }]), false);
+  assert.equal(await put([BOOT_ENTRY, { email: '  ', role: 'manager' }]), false);
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER, role: 'manager' }, { email: OWNER.toUpperCase(), role: 'admin' }]), false); // same address twice
+  assert.equal(await put([{ email: BOOT_ENTRY.email, role: 'manager' }, BOOT_ENTRY]), false); // bootstrap address twice
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER, role: 'manager', locked: true }]), false); // only the bootstrap admin is locked
+  assert.equal(await put([BOOT_ENTRY, { email: OWNER, role: 'manager', locked: false }]), false);
+  assert.equal(await can(ADMIN, 'PUT', 'config/roles', null), false);
+  assert.equal(await can(ADMIN, 'PUT', 'config/roles'), false);
+  // PATCH merges: without `entries` nothing about the list changes; with it the same rule applies
+  assert.equal(await can(ADMIN, 'PATCH', 'config/roles', {}), true);
+  assert.equal(await can(ADMIN, 'PATCH', 'config/roles', { entries: [] }), false);
+  assert.equal(await can(ADMIN, 'PATCH', 'config/roles', { entries: [BOOT_ENTRY] }), true);
+  assert.equal(await can(ADMIN, 'DELETE', 'config/roles'), false);
+  // non-admins never write, whatever the body; reads are unchanged
+  assert.equal(await can(OWNER, 'PUT', 'config/roles', { entries: [BOOT_ENTRY] }), false);
+  assert.equal(await can(GUEST, 'GET', 'config/roles'), true);
+  assert.equal(await can(null, 'GET', 'config/roles'), false);
+});
+
+test('config/roles: with no bootstrap admin configured any admin write is allowed', async () => {
+  const r = (method, body) => authorize({ method, path: 'config/roles', body, session: { email: ADMIN }, rolesDoc, bootstrapAdminEmail: '', loadDoc, now: NOW });
+  assert.equal(await r('PUT', { entries: [] }), true);
+  assert.equal(await r('DELETE'), true);
+});
+
 test('config: roles are admin-only to write, app settings manager-only', async () => {
   assert.equal(await can(GUEST, 'GET', 'config/roles'), true);
   assert.equal(await can(OWNER, 'PUT', 'config/roles', {}), false);
-  assert.equal(await can(ADMIN, 'PUT', 'config/roles', {}), true);
+  assert.equal(await can(ADMIN, 'PUT', 'config/roles', { entries: [BOOT_ENTRY] }), true);
   assert.equal(await can(OWNER, 'PUT', 'config/app', {}), true);
   assert.equal(await can(GUEST, 'PUT', 'config/app', {}), false);
   assert.equal(await can(OWNER, 'GET', 'other/path'), false);
@@ -197,7 +242,8 @@ test('att: managers read the list but only touch their own document', async () =
 
   const own = await attPath(OWNER);
   assert.equal(await can(OWNER, 'GET', own), true);
-  assert.equal(await can(OWNER, 'PUT', own, {}), true);
+  assert.equal(await can(OWNER, 'PUT', own, { uid: own.slice(4), email: OWNER }), true);
+  assert.equal(await can(OWNER, 'PUT', own, {}), false); // a new document must say whose it is
   assert.equal(await can(OWNER, 'PATCH', own, {}), true);
 
   const theirs = await attPath(OTHER);
@@ -209,7 +255,8 @@ test('att: managers read the list but only touch their own document', async () =
 });
 
 test('att: an attendee touches only their own document', async () => {
-  assert.equal(await can(GUEST, 'PUT', await attPath(GUEST), {}), true);
+  const guestPath = await attPath(GUEST);
+  assert.equal(await can(GUEST, 'PUT', guestPath, { uid: guestPath.slice(4), email: GUEST }), true);
   assert.equal(await can(GUEST, 'GET', await attPath(OWNER)), false);
   assert.equal(await can(null, 'GET', await attPath(OWNER)), false);
   assert.equal(await can(OWNER, 'GET', `${await attPath(OWNER)}/nested`), false);
@@ -217,27 +264,44 @@ test('att: an attendee touches only their own document', async () => {
   assert.equal(await can(GUEST, 'GET', `${await attPath(GUEST)}x`), false); // own key plus a suffix is another key
 });
 
-test('eventIdsOwnedBy lists the events created by that email, ignoring case', () => {
-  const events = [
-    { id: 'a', data: { createdBy: OWNER } },
-    { id: 'b', data: { createdBy: OTHER } },
-    { id: 'c', data: { createdBy: null } },
-  ];
-  assert.deepEqual(eventIdsOwnedBy(events, OWNER.toUpperCase()), ['a']);
-});
-
-test('filterAttRecords keeps only owned events and drops attendees left with none', () => {
-  const list = [
-    { id: 'ka', exists: true, data: { uid: 'ka', email: 'a@x.vn', records: { a: { at: 1 }, b: { at: 2 } } } },
-    { id: 'kb', exists: true, data: { uid: 'kb', email: 'b@x.vn', records: { b: { at: 3 } } } },
-    { id: 'kc', exists: true, data: { uid: 'kc', email: 'c@x.vn' } },
-  ];
-  const out = filterAttRecords(list, ['a']);
-  assert.equal(out.length, 1);
-  assert.equal(out[0].id, 'ka');
-  assert.equal(out[0].data.email, 'a@x.vn');
-  assert.deepEqual(Object.keys(out[0].data.records), ['a']);
-  assert.deepEqual(Object.keys(list[0].data.records), ['a', 'b']); // input not mutated
+test('att: own-key writes accept only valid check-in records, never DELETE', async () => {
+  const day = Date.parse('2026-09-25T09:00:00Z'); // inside the event below, unlike the shared NOW
+  const start = new Date(day).toISOString();
+  const end = new Date(day + 3 * 3600e3).toISOString();
+  const rec = (event, metres, at = NOW) => {
+    const lat = event.lat + metres / 111195;
+    const dist = Math.round(haversine(event.lat, event.lng, lat, event.lng) * 10) / 10;
+    return { at: new Date(at).toISOString(), lat, lng: event.lng, acc: 10, dist, limit: judgeFix(event, dist, 10).limit };
+  };
+  for (const who of [GUEST, OWNER]) {
+    const hash = await hashEmail(who);
+    const event = { start, end, lat: 21, lng: 105.8, radius: 30, emailHashes: [hash] };
+    const notInvited = { ...event, emailHashes: [await hashEmail(OTHER)] };
+    const load = async (p) => ({ 'events/mine': event, 'events/theirs': notInvited })[p] ?? docs[p] ?? null;
+    const go = (email, method, path, body) => authorize({
+      method, path, body, session: { email }, rolesDoc, bootstrapAdminEmail: 'boot@tbd.edu.vn', loadDoc: load, now: NOW,
+    });
+    const own = await attPath(who);
+    const good = rec(event, 10);
+    assert.equal(await go(who, 'PUT', own, { uid: own.slice(4), email: who, name: 'N', records: { mine: good } }), true, who);
+    assert.equal(await go(who, 'PATCH', own, { email: who, name: 'N', records: { mine: good } }), true, who);
+    assert.equal(await go(who, 'GET', own), true, who);
+    assert.equal(await go(who, 'PATCH', own, { records: { mine: { ...good, dist: 1 } } }), false, who); // forged distance
+    assert.equal(await go(who, 'PATCH', own, { records: { mine: { ...good, extra: 1 } } }), false, who);
+    assert.equal(await go(who, 'PATCH', own, { records: { theirs: rec(notInvited, 10) } }), false, who); // not invited
+    assert.equal(await go(who, 'PATCH', own, { records: { none: good } }), false, who); // unknown event
+    assert.equal(await go(who, 'PATCH', own, { email: OTHER, records: { mine: good } }), false, who);
+    assert.equal(await go(who, 'DELETE', own), false, who);
+    // History stored server-side cannot be dropped by a PUT nor altered by a PATCH.
+    const withHistory = (p) => (p === own ? { uid: own.slice(4), records: { mine: good } } : load(p));
+    const goH = (method, body) => authorize({ method, path: own, body, session: { email: who }, rolesDoc, bootstrapAdminEmail: 'boot@tbd.edu.vn', loadDoc: withHistory, now: NOW });
+    assert.equal(await goH('PUT', { records: {} }), false, who);
+    assert.equal(await goH('PATCH', { records: { mine: { ...good, dist: 1 } } }), false, who);
+    assert.equal(await goH('PATCH', { records: { mine: good } }), true, who);
+    assert.equal(await go(ADMIN, 'DELETE', own), true, 'admin may delete');
+    assert.equal(await go(ADMIN, 'PUT', own, { anything: [1] }), true, 'admin may write anything');
+    assert.equal(await go(ADMIN, 'PATCH', own, { records: { mine: { forged: true } } }), true);
+  }
 });
 
 test('paths outside the known families are refused, even for an admin', async () => {
@@ -263,4 +327,29 @@ test('unknown methods are refused in every family', async () => {
 test('events: createdBy must be a string', async () => {
   assert.equal(await can(OWNER, 'PUT', 'events/new', { createdBy: [OWNER] }), false);
   assert.equal(await can(OWNER, 'PUT', 'events/future', { createdBy: [OWNER] }), false);
+});
+
+test('paths containing __proto__ are refused, even for an admin', async () => {
+  for (const p of ['events/__proto__', 'roster/__proto__', 'att/__proto__', 'events/x/__proto__']) {
+    assert.equal(await can(ADMIN, 'GET', p), false, p);
+    assert.equal(await can(ADMIN, 'PUT', p, { createdBy: ADMIN }), false, p);
+  }
+});
+
+test('a damaged roles document does not break authorization for everyone', async () => {
+  const run = (rolesDoc, method, path, body) => authorize({
+    method, path, body, session: { email: OWNER }, rolesDoc, bootstrapAdminEmail: 'boot@tbd.edu.vn', loadDoc, now: NOW,
+  });
+  for (const damaged of [
+    { entries: [null, 'x', {}, { email: 5 }, [1], { email: OWNER, role: 'manager' }] },
+    { entries: 'nope' },
+    { entries: null },
+    {},
+  ]) {
+    assert.equal(await run(damaged, 'GET', 'events/future'), true);
+  }
+  // A manager listed after the junk entries is still recognised as one (and owns the event).
+  const junk = { entries: [null, 'x', {}, { email: OWNER, role: 'manager' }] };
+  assert.equal(await run(junk, 'PATCH', 'events/future', { title: 'x' }), true);
+  assert.equal(await run({ entries: [null] }, 'PATCH', 'events/future', { title: 'x' }), false);
 });

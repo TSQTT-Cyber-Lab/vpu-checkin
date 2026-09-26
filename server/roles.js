@@ -20,7 +20,9 @@ export function attKeyOf(hash) {
 function findRole(rolesDoc, email) {
   if (!email) return null;
   const norm = normalizeEmail(email);
-  return rolesDoc?.entries?.find((e) => normalizeEmail(e.email) === norm) ?? null;
+  // Tolerate a damaged document: one junk entry must not make every request throw.
+  const entries = Array.isArray(rolesDoc?.entries) ? rolesDoc.entries : [];
+  return entries.find((e) => e && typeof e.email === 'string' && normalizeEmail(e.email) === norm) ?? null;
 }
 
 /**

@@ -120,7 +120,11 @@ export function EventForm({ p, session, initial, onSaved, onCancel }: {
       // A search that fails or finds nothing must not erase a match the event already had.
       map = Object.fromEntries(emails.map((m) => [m, map[m] ?? initial?.roster.map[m] ?? null]));
       const uids = uidsOf(map);
+      // An edit keeps every stored field the form does not own (e.g. reportSentAt, written by server/reports.js).
+      const kept: Record<string, unknown> = ev0 ? { ...ev0 } : {};
+      delete kept.id; // the row id is not part of the stored document
       const doc: EventDoc = {
+        ...kept,
         title: title.trim(), location: location.trim(),
         start: keepIfSameMinute(start, ev0?.start, s), end: keepIfSameMinute(end, ev0?.end, e),
         lat: la, lng: ln, radius: Math.round(r), tolerance: Math.round(tol), window: win,

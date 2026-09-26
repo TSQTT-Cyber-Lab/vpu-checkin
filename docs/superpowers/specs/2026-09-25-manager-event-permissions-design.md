@@ -122,9 +122,7 @@ Không đổi. Người quản lý đã tự điểm danh như người tham d�
 
 ## 7. Ngoài phạm vi (chỉ ghi nhận)
 
-- Máy chủ chưa kiểm tra nội dung điểm danh (giờ, vị trí, có trong danh sách mời hay không); người dùng đã đăng nhập có thể gửi bản ghi giả cho chính khoá của mình qua API.
 - `config/app` (URL gốc của mã QR) vẫn cho mọi người quản lý ghi, ảnh hưởng mọi sự kiện.
-- Quản trị viên khởi tạo từ `BOOTSTRAP_ADMIN_EMAIL` luôn là admin ở máy chủ dù bị đổi vai trò trong `config/roles`, và giao diện không biết điều này.
 - Người tạo có thể xoá rồi tạo lại sự kiện cùng id để đổi nội dung sau giờ bắt đầu. Điểm danh của sự kiện bị xoá theo (xoá dây chuyền) nên chấp nhận được.
 - Sự kiện cũ không có `createdBy` (null) chỉ quản trị viên thấy trong tab Quản lý, sửa hoặc xoá được; người quản lý thường không còn thấy chúng ở tab đó. Trước khi triển khai nên kiểm tra: `SELECT path FROM documents WHERE path LIKE 'events/%' AND (data->>'createdBy') IS NULL;`
 - **Dọn dữ liệu cũ khi triển khai (chạy một lần, sau khi sao lưu).** Vòng lặp xoá ở client trước đây không xoá được bản ghi điểm danh, nên có thể còn điểm danh và roster "mồ côi" của các sự kiện đã xoá. Người quản lý có thể tạo sự kiện mới trùng id cũ để xem lại chúng. Hai câu lệnh sau đã được chạy thử trên Postgres 15 với dữ liệu mẫu (kể cả bản ghi `records` dạng mảng, bản ghi lồng và roster vừa tạo):
@@ -145,12 +143,22 @@ Không đổi. Người quản lý đã tự điểm danh như người tham d�
     AND r.updated_at < now() - interval '1 hour';
   ```
 - `window` và `tolerance` chưa được kiểm tra kiểu giá trị (một giá trị không phải số làm giờ đóng điểm danh không tính được). Đã có từ trước, chỉ áp dụng cho sự kiện của chính người gửi.
-- Đã có từ trước: một lỗi trong handler async của Express 4 làm sập tiến trình Node (ví dụ `PUT /doc/att/<khoá của mình>` với thân là mảng JSON cấp cao nhất).
-- Quản trị viên tự hạ vai trò của chính mình bằng nút Sửa không cần xác nhận (nút thu hồi của chính mình có nhãn riêng "Bỏ quyền của tôi").
 - Form sửa lưu `roster` trước rồi mới lưu sự kiện; nếu giờ bắt đầu trôi qua đúng giữa hai lần ghi thì roster mới đi cùng sự kiện cũ (khoảng thời gian rất hẹp).
-- Danh sách sự kiện làm mới ~3 giây một lần: mở lại form sửa ngay sau khi lưu có thể hiện dữ liệu cũ, và lưu tiếp sẽ ghi đè bằng dữ liệu cũ đó.
 - Quản trị viên không đổi được giờ bắt đầu của sự kiện đã bắt đầu sang một giờ khác trong quá khứ (chỉ được giữ nguyên hoặc đặt sang tương lai).
-- Form sửa gửi PUT đầy đủ chỉ với các trường của `EventDoc`. `server/reports.js` ghi thêm `reportSentAt` / `reportAttemptAt` vào sự kiện; nếu bộ lập lịch báo cáo được bật sau này, quản trị viên sửa một sự kiện đã kết thúc sẽ xoá các trường đó và báo cáo có thể bị gửi lại. Hiện `server/index.js` chưa khởi động bộ lập lịch nên chưa xảy ra; khi bật cần cho form giữ lại các trường lạ của `ev0`.
-- Giới hạn quy mô: danh sách điểm danh của người quản lý được dựng từ tối đa 2000 bản ghi `att` và 2000 sự kiện đầu tiên theo thứ tự đường dẫn; vượt mức đó người quản lý thường sẽ thiếu bản ghi (trước đây client đã giới hạn 1000 cho mọi người, nên không tệ hơn).
 - Các mục tab Quản lý của bản demo: `seedDemo` tạo mọi sự kiện mẫu dưới email quản trị, nên đăng nhập `lan.nt@…` sẽ thấy tab Quản lý trống cho tới khi tự tạo sự kiện (đúng theo quy tắc mới).
-- Thư mục dự án đã trở thành git repo (gắn với `origin` trên GitHub) trong lúc thực hiện; các thay đổi của tính năng này chưa được commit.
+- Máy chủ không thể biết toạ độ GPS có thật hay không: một máy khách cố tình gửi toạ độ giả nằm trong phòng vẫn được chấp nhận (chỉ chặn được người không được mời, ngoài giờ, sửa/xoá lịch sử, mạo danh và dữ liệu tự mâu thuẫn).
+- Sự kiện cũ không có `emailHashes` (thời claude.ai, chỉ có `uids`) không thể điểm danh qua máy chủ, dù giao diện vẫn hiện nút. Form tạo sự kiện hiện tại luôn ghi `emailHashes`.
+- Kiểm tra rồi ghi điểm danh không nằm trong một giao dịch: hai lượt PATCH đồng thời vào cùng một bản ghi mới có thể để lại bản ghi của lượt ghi sau (cả hai đều hợp lệ và chỉ ảnh hưởng chính người gửi). Muốn chặt hơn cần `SELECT … FOR UPDATE` hoặc `UPDATE` có điều kiện.
+- So khớp `createdBy` trong SQL dùng `\s` của Postgres (khoảng trắng ASCII), hẹp hơn phép chuẩn hoá của JS với khoảng trắng Unicode hiếm gặp; chỉ có thể khiến người tạo không thấy điểm danh của sự kiện đó, không bao giờ lộ thêm dữ liệu.
+- Thư mục dự án đã trở thành git repo (gắn với `origin` trên GitHub) trong lúc thực hiện; tính năng đã được commit và push (38eb63d, README ed24729).
+
+## 8. Đã xử lý sau khi hoàn tất (2026-09-26)
+
+- Form sửa giữ lại mọi trường đã lưu mà form không quản lý (ví dụ `reportSentAt`, `reportAttemptAt`), thay vì xoá chúng khi PUT.
+- Handler async của Express được bọc: lỗi cơ sở dữ liệu hay yêu cầu hỏng trả 500 thay vì làm sập Node; thân PUT/PATCH không phải đối tượng JSON trả 400 (sau bước kiểm tra quyền).
+- Nút **Sửa sự kiện** bị khoá 4 giây sau khi lưu (dài hơn chu kỳ làm mới ~3 giây) để không mở lại form với dữ liệu cũ.
+- Quản trị viên tự hạ vai trò của chính mình bằng nút Sửa phải bấm thêm "Xác nhận hạ vai trò".
+- **Máy chủ kiểm tra điểm danh** (`server/checkin.js`, móc trong `authorize.js`): ghi vào `att/<khoá của mình>` chỉ nhận PUT/PATCH đúng dạng; `uid` = khoá và `email` = người gọi (bắt buộc khi PUT); bản ghi đã có là bất biến và không xoá được lịch sử (kể cả DELETE); mỗi bản ghi mới phải cho một sự kiện có email người gọi trong `emailHashes`, trong khung giờ điểm danh (nới 30 giây hai đầu), `at` đúng dạng ISO, lệch giờ máy chủ tối đa 10 phút và nằm trong khung giờ, toạ độ hợp lệ, `dist` khớp giá trị tính lại (±1 m), nằm trong bán kính + min(sai số, dung sai), `limit` (nếu có) lệch tối đa 1. Thông báo lỗi 403 khi điểm danh nay nêu các nguyên nhân thường gặp.
+- **Danh sách điểm danh của người quản lý lọc ngay trong SQL** (`listEventIdsCreatedBy`, `listAttForEvents`), bỏ giới hạn 2000; bản ghi có `records` không phải đối tượng bị bỏ qua.
+- **Admin khởi tạo được khoá và đồng bộ**: khi khởi động máy chủ ghi mục `BOOTSTRAP_ADMIN_EMAIL` là `{role: admin, locked: true}`, loại bỏ mục rác và mục trùng, gỡ cờ `locked` ở địa chỉ khác. `PUT config/roles` phải là danh sách hợp lệ (mỗi mục là đối tượng có `email` dạng chuỗi và vai trò `admin`/`manager`, không trùng địa chỉ, `locked` chỉ ở mục admin khởi tạo) và giữ mục đó; DELETE bị từ chối. Giao diện hiện dòng đó là "Mặc định · không thể sửa hay thu hồi" và ẩn dòng "chủ sở hữu trang" giả. `findRole` chịu được tài liệu vai trò bị hỏng.
+- Đường dẫn chứa `__proto__` bị từ chối.

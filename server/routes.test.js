@@ -41,12 +41,24 @@ function fakeStore() {
       .sort(([a], [b]) => a.localeCompare(b))
       .slice(0, limit)
       .map(([k, data]) => ({ id: k.split('/').pop(), exists: true, data })),
+    // Same contract as the SQL versions in db.js (the end-to-end run checks those against real Postgres).
+    listEventIdsCreatedBy: async (email) => [...docs.entries()]
+      .filter(([k, d]) => /^events\/[^/]+$/.test(k) && typeof d.createdBy === 'string' && d.createdBy.trim().toLowerCase() === String(email).trim().toLowerCase())
+      .map(([k]) => k.slice('events/'.length)),
+    listAttForEvents: async (ids, limit) => [...docs.entries()]
+      .filter(([k, d]) => /^att\/[^/]+$/.test(k) && d.records && typeof d.records === 'object' && !Array.isArray(d.records))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, d]) => ({ k, d, records: Object.fromEntries(Object.entries(d.records).filter(([id]) => ids.includes(id))) }))
+      .filter((x) => Object.keys(x.records).length > 0)
+      .slice(0, limit)
+      .map((x) => ({ id: x.k.slice('att/'.length), exists: true, data: { ...x.d, records: x.records } })),
   };
 }
 
 // Stands in for sessionMiddleware: the caller's email travels in a header.
-async function withApi(fn) {
+async function withApi(fn, tweak) {
   const store = fakeStore();
+  tweak?.(store); // lets a test break part of the store before the router captures its methods
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -146,5 +158,26 @@ test('roster and att of other people are closed to a manager', async () => {
     assert.equal((await call(OWNER, 'GET', 'doc/roster/mine')).status, 200);
     assert.equal((await call(OWNER, 'GET', 'doc/att/ka')).status, 403);
     assert.equal((await call(ADMIN, 'GET', 'doc/att/ka')).status, 200);
+  });
+});
+
+test('a failing store answers 500 and the server keeps serving', async () => {
+  await withApi(async ({ call }) => {
+    const r = await call(ADMIN, 'PUT', 'doc/config/app', { baseUrl: 'https://x.test' });
+    assert.equal(r.status, 500);
+    // The process survived: the next request is served normally.
+    assert.equal((await call(ADMIN, 'GET', 'doc/config/app')).status, 200);
+  }, (store) => { store.setDoc = async () => { throw new Error('db down'); }; });
+});
+
+test('write bodies must be JSON objects, not arrays', async () => {
+  await withApi(async ({ call, store }) => {
+    for (const method of ['PUT', 'PATCH']) {
+      // OWNER is a manager, so the write is authorised and reaches the body check.
+      assert.equal((await call(OWNER, method, 'doc/config/app', [1, 2])).status, 400, `${method} with an array body`);
+    }
+    assert.equal(store.docs.has('config/app'), false);
+    // Authorisation still comes first: an attendee gets 403, not 400.
+    assert.equal((await call(GUEST, 'PUT', 'doc/config/app', [1, 2])).status, 403);
   });
 });

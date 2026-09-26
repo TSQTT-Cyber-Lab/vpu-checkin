@@ -137,7 +137,8 @@ export function CheckinView({ p, session, events, now, preferredId }: {
         body: code === 'invalid_argument'
           ? 'Tài khoản của bạn chưa có quyền ghi điểm danh. Liên hệ người tổ chức để được cấp quyền "Có thể tương tác" với trang này.'
           : code === 'quota_exceeded' ? 'Kho dữ liệu điểm danh đã đầy. Báo người tổ chức để dọn các sự kiện cũ.'
-            : err?.message || 'Lỗi không xác định. Thử lại sau vài giây.',
+            : code === 'forbidden' ? 'Máy chủ từ chối lượt điểm danh. Kiểm tra giờ trên điện thoại (không lệch quá 10 phút), khung giờ điểm danh, vị trí và email của bạn có trong danh sách mời; nếu vừa có người sửa sự kiện, hãy tải lại trang rồi thử lại.'
+              : err?.message || 'Lỗi không xác định. Thử lại sau vài giây.',
       });
     } finally {
       setBusy(false);
